@@ -38,11 +38,11 @@ echo "--- empty-password accounts ---"; awk -F: '($2==""){print $1}' /etc/shadow
 pause_step "Review accounts against the scoring packet before removing or changing any user."
 
 # Built-in guest-style accounts: lock only if present; do not remove.
-for u in guest nobody; do
-    if id "$u" >/dev/null 2>&1 && [ "$u" != "nobody" ]; then
-        passwd -l "$u" 2>/dev/null || true
-    fi
-done
+# (nobody is intentionally left alone -- it has no valid login shell/password
+# by default and locking it is not a meaningful hardening action.)
+if id guest >/dev/null 2>&1; then
+    try "Locking guest account" passwd -l guest
+fi
 
 step "PASSWORD AGING"
 cp -a /etc/login.defs "$BACKUP/login.defs.prechange"
@@ -51,16 +51,50 @@ sed -i -E 's/^[[:space:]]*PASS_MIN_DAYS[[:space:]].*/PASS_MIN_DAYS   1/' /etc/lo
 sed -i -E 's/^[[:space:]]*PASS_WARN_AGE[[:space:]].*/PASS_WARN_AGE   7/' /etc/login.defs
 grep -E '^[[:space:]]*PASS_(MAX|MIN|WARN)_DAYS' /etc/login.defs
 
+# login.defs only affects accounts created AFTER this change -- it does NOT
+# retroactively update existing users. Apply the same aging values directly
+# to existing real (UID >= 1000) accounts with chage.
+warn "Applying password aging to existing accounts (login.defs only affects new accounts)."
+while IFS=: read -r uname _ uid _; do
+    if [ "$uid" -ge 1000 ] 2>/dev/null; then
+        try "Setting password aging for $uname" chage --maxdays 90 --mindays 1 --warndays 7 "$uname"
+    fi
+done < /etc/passwd
+
 step "PAM / PASSWORD COMPLEXITY"
 if command -v pam-auth-update >/dev/null; then pam-auth-update --package >/dev/null 2>&1 || true; fi
-dpkg-query -W -f='${Status}\n' libpam-pwquality 2>/dev/null | grep -q "install ok installed" &&
-    ok "libpam-pwquality is installed" || warn "libpam-pwquality not installed; install only if allowed by the image/rules."
+if dpkg-query -W -f='${Status}\n' libpam-pwquality 2>/dev/null | grep -q "install ok installed"; then
+    ok "libpam-pwquality is installed"
+    # Detecting the package is not the same as enforcing anything -- without
+    # this, nothing actually requires a minimum length or complexity. Back up
+    # pwquality.conf, then set a baseline minlen/complexity if one isn't
+    # already configured more strictly.
+    if [ -f /etc/security/pwquality.conf ]; then
+        cp -a /etc/security/pwquality.conf "$BACKUP/pwquality.conf.prechange"
+        if ! grep -qE '^[[:space:]]*minlen[[:space:]]*=' /etc/security/pwquality.conf; then
+            echo "minlen = 10" >> /etc/security/pwquality.conf
+        fi
+        for opt in dcredit=-1 ucredit=-1 lcredit=-1 ocredit=-1; do
+            key="${opt%%=*}"
+            if ! grep -qE "^[[:space:]]*${key}[[:space:]]*=" /etc/security/pwquality.conf; then
+                echo "$opt" >> /etc/security/pwquality.conf
+            fi
+        done
+        ok "Baseline pwquality settings ensured in /etc/security/pwquality.conf"
+        warn "Adjust minlen/credit values to match the exact scoring requirement if different."
+    else
+        warn "/etc/security/pwquality.conf not found; complexity not enforced."
+    fi
+else
+    warn "libpam-pwquality not installed; install only if allowed by the image/rules."
+fi
 warn "Do not overwrite PAM files blindly; exact distro/version/scoring requirements vary."
 
 step "FIREWALL"
 if command -v ufw >/dev/null; then
     ufw default deny incoming
     ufw default allow outgoing
+    ufw logging on
     ufw --force enable
     ufw status verbose
 elif command -v nft >/dev/null; then
@@ -109,6 +143,21 @@ if command -v auditctl >/dev/null; then
     auditctl -w /etc/shadow -p wa -k identity 2>/dev/null || true
     auditctl -w /etc/group -p wa -k identity 2>/dev/null || true
     auditctl -w /etc/sudoers -p wa -k scope 2>/dev/null || true
+    # auditctl -w only sets RUNTIME rules -- they are lost on reboot unless
+    # also written to a persistent rules file that auditd loads at startup.
+    if [ -d /etc/audit/rules.d ]; then
+        RULES_FILE=/etc/audit/rules.d/cyberpatriot-hardening.rules
+        [ -f "$RULES_FILE" ] && cp -a "$RULES_FILE" "$BACKUP/$(basename "$RULES_FILE").prechange"
+        cat > "$RULES_FILE" <<'EOF'
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/sudoers -p wa -k scope
+EOF
+        try "Persisting audit rules across reboot" augenrules --load
+    else
+        warn "/etc/audit/rules.d not found; audit watches will not survive a reboot."
+    fi
 else
     warn "auditd/auditctl not installed. Check scoring requirements before installing packages."
 fi
@@ -137,8 +186,28 @@ find /home /root -type f \( -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.avi' -
 warn "LIST ONLY: verify against scoring/forensics before deletion."
 
 step "KERNEL / SECURITY SETTINGS"
+echo "--- current values ---"
 sysctl -a 2>/dev/null | grep -E '^(net\.ipv4\.ip_forward|net\.ipv4\.conf\..*\.accept_redirects|net\.ipv4\.conf\..*\.send_redirects|net\.ipv4\.conf\..*\.rp_filter|net\.ipv4\.icmp_echo_ignore_broadcasts)' | head -100
-warn "Do not force sysctl values without checking whether the image requires routing, virtualization, or networking behavior."
+warn "ip_forward is left untouched -- routing requirements are genuinely image-specific."
+
+# The following are safe on the large majority of CyberPatriot images (they
+# don't route traffic for other hosts) and are commonly scored. Written to a
+# dedicated file (backed up if it already exists) rather than editing
+# sysctl.conf directly, so it's easy to identify/revert.
+SYSCTL_FILE=/etc/sysctl.d/60-cyberpatriot-hardening.conf
+[ -f "$SYSCTL_FILE" ] && cp -a "$SYSCTL_FILE" "$BACKUP/$(basename "$SYSCTL_FILE").prechange"
+cat > "$SYSCTL_FILE" <<'EOF'
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+EOF
+try "Applying network hardening sysctls" sysctl --system
 
 step "UPDATES"
 if command -v apt-get >/dev/null; then
