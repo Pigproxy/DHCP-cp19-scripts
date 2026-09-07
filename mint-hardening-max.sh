@@ -1,6 +1,4 @@
 #!/bin/bash
-# CyberPatriot Linux Mint Hardening — aggressive defensive baseline
-# Review the README/scoring packet and forensics questions FIRST.
 # Run: sudo bash mint-hardening-max.sh
 set -u
 
