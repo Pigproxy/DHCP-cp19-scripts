@@ -13,12 +13,30 @@ function Step($Name) { Write-Host "`n=== $Name ===" -ForegroundColor Cyan }
 function Ok($Text) { Write-Host "[OK] $Text" -ForegroundColor Green }
 function Warn($Text) { Write-Host "[REVIEW] $Text" -ForegroundColor Yellow }
 function Try-Do($Text, [scriptblock]$Action) {
+    # Force terminating errors for the duration of this action only, so that
+    # non-terminating cmdlet errors (the default under $ErrorActionPreference =
+    # 'Continue') are actually caught here instead of silently printing an
+    # error to the console while Try-Do reports [OK] anyway.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
     try { & $Action; Ok $Text }
     catch { Warn "$Text -- $($_.Exception.Message)" }
+    finally { $ErrorActionPreference = $prevEAP }
 }
 function Pause-Step($Message) {
     Write-Host "`n[CHECKPOINT] $Message" -ForegroundColor Yellow
     Read-Host "Press Enter to continue (Ctrl+C to stop)"
+}
+function Invoke-Native {
+    # Runs an external .exe and throws if it returns a non-zero exit code.
+    # Needed because PowerShell's try/catch does NOT catch a failing native
+    # command by itself -- a non-zero exit code from reg.exe/secedit.exe/
+    # netsh.exe/net.exe/auditpol.exe just prints text and continues.
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @())
+    & $FilePath @ArgumentList
+    if ($LASTEXITCODE -ne 0) {
+        throw "$FilePath $($ArgumentList -join ' ') exited with code $LASTEXITCODE"
+    }
 }
 
 # ---- Competition-specific knobs: change these to match the scoring packet ----
@@ -50,13 +68,13 @@ Pause-Step "Confirm the forensics/scoring questions have been reviewed."
 
 Step "BACKUP / BASELINE"
 Try-Do "Exporting registry backup" {
-    reg.exe export HKLM "$BackupRoot\HKLM.reg" /y | Out-Null
+    Invoke-Native reg.exe @('export','HKLM',"$BackupRoot\HKLM.reg",'/y')
 }
 Try-Do "Exporting security policy" {
-    secedit.exe /export /cfg "$BackupRoot\secpol-before.inf" /quiet
+    Invoke-Native secedit.exe @('/export','/cfg',"$BackupRoot\secpol-before.inf",'/quiet')
 }
 Try-Do "Saving firewall configuration" {
-    netsh.exe advfirewall export "$BackupRoot\firewall-before.wfw" | Out-Null
+    Invoke-Native netsh.exe @('advfirewall','export',"$BackupRoot\firewall-before.wfw")
 }
 Try-Do "Saving service configuration" {
     Get-Service | Select-Object Name,Status,StartType | Export-Csv "$BackupRoot\services-before.csv" -NoTypeInformation
@@ -65,7 +83,10 @@ Try-Do "Saving service configuration" {
 Step "ACCOUNT AUDIT"
 Get-LocalUser | Select-Object Name,Enabled,LastLogon,PasswordRequired | Format-Table -AutoSize
 Write-Host "`nAdministrators:" -ForegroundColor White
-Get-LocalGroupMember -Group Administrators | Select-Object Name,ObjectClass | Format-Table -AutoSize
+# S-1-5-32-544 is the well-known SID for the built-in Administrators group;
+# using it instead of the localized name "Administrators" keeps this working
+# on non-English-language images.
+Get-LocalGroupMember -SID 'S-1-5-32-544' | Select-Object Name,ObjectClass | Format-Table -AutoSize
 Write-Host "`nReview every account against the scoring packet. Do not remove required/scoring accounts." -ForegroundColor Yellow
 
 # Guest is normally unnecessary and is a standard hardening action.
@@ -75,15 +96,37 @@ Try-Do "Disabling built-in Guest account" {
 
 Step "PASSWORD / LOCKOUT POLICY"
 Try-Do "Applying account policy baseline" {
-    net.exe accounts `
-        /minpwlen:$MinPasswordLength `
-        /maxpwage:$MaxPasswordAge `
-        /minpwage:$MinPasswordAge `
-        /lockoutthreshold:$LockoutThreshold `
-        /lockoutduration:$LockoutDuration `
-        /lockoutwindow:$LockoutWindow | Out-Null
+    Invoke-Native net.exe @(
+        'accounts',
+        "/minpwlen:$MinPasswordLength",
+        "/maxpwage:$MaxPasswordAge",
+        "/minpwage:$MinPasswordAge",
+        "/lockoutthreshold:$LockoutThreshold",
+        "/lockoutduration:$LockoutDuration",
+        "/lockoutwindow:$LockoutWindow"
+    )
 }
 Warn "If the scoring packet specifies different exact values, change the variables at the top before running."
+
+# net.exe accounts cannot set "Password must meet complexity requirements" or
+# "Store passwords using reversible encryption" -- those live in the local
+# security policy and must go through secedit. This is a commonly-scored
+# item that a net-accounts-only script silently misses.
+Try-Do "Enabling password complexity and disabling reversible encryption" {
+    $secTemplate = Join-Path $BackupRoot 'secpol-complexity.inf'
+    $secDb = Join-Path $BackupRoot 'secpol-complexity.sdb'
+@"
+[Unicode]
+Unicode=yes
+[System Access]
+PasswordComplexity = 1
+ClearTextPassword = 0
+[Version]
+signature="`$CHICAGO`$"
+Revision=1
+"@ | Out-File -FilePath $secTemplate -Encoding unicode
+    Invoke-Native secedit.exe @('/configure','/db',$secDb,'/cfg',$secTemplate,'/areas','SECURITYPOLICY','/quiet')
+}
 
 Step "FIREWALL"
 Try-Do "Enabling Windows Firewall for all profiles" {
@@ -171,21 +214,31 @@ Try-Do "Disabling LAN Manager hash storage" {
     $lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
     Set-ItemProperty $lsa NoLMHash 1
 }
-Try-Do "Disabling LLMNR" {
-    New-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Force | Out-Null
-    Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' EnableMulticast 0
+if ($DisableLlmnr) {
+    Try-Do "Disabling LLMNR" {
+        New-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Force | Out-Null
+        Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' EnableMulticast 0
+    }
+}
+if ($DisableNetbios) {
+    Try-Do "Disabling NetBIOS over TCP/IP on all adapters" {
+        # WMI NetbiosOptions: 0 = use DHCP default, 1 = enable, 2 = disable
+        $adapters = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True"
+        foreach ($nic in $adapters) {
+            Invoke-CimMethod -InputObject $nic -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = 2 } | Out-Null
+        }
+    }
 }
 
 Step "AUDITING"
-Try-Do "Enabling advanced audit categories" {
-    auditpol.exe /set /subcategory:"Logon" /success:enable /failure:enable | Out-Null
-    auditpol.exe /set /subcategory:"Account Lockout" /success:enable /failure:enable | Out-Null
-    auditpol.exe /set /subcategory:"User Account Management" /success:enable /failure:enable | Out-Null
-    auditpol.exe /set /subcategory:"Security Group Management" /success:enable /failure:enable | Out-Null
-    auditpol.exe /set /subcategory:"Process Creation" /success:enable /failure:enable | Out-Null
-    auditpol.exe /set /subcategory:"Sensitive Privilege Use" /success:enable /failure:enable | Out-Null
-    auditpol.exe /set /subcategory:"Audit Policy Change" /success:enable /failure:enable | Out-Null
-    auditpol.exe /set /subcategory:"System Integrity" /success:enable /failure:enable | Out-Null
+$auditCategories = @(
+    'Logon','Account Lockout','User Account Management','Security Group Management',
+    'Process Creation','Sensitive Privilege Use','Audit Policy Change','System Integrity'
+)
+foreach ($cat in $auditCategories) {
+    Try-Do "Enabling auditing for '$cat'" {
+        Invoke-Native auditpol.exe @('/set',"/subcategory:$cat",'/success:enable','/failure:enable')
+    }
 }
 Try-Do "Enabling command-line auditing for process creation" {
     New-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Force | Out-Null
